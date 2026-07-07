@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""
+Daily Opportunity Scan
+-----------------------
+Reads sources.json (the 351-institution list), runs a keyword search per
+source via Google News RSS (no API key needed), keeps track of what's
+already been seen (seen.json), and emails a digest of new items to the
+client. High-priority tiers are scanned every day; lower tiers are scanned
+on a weekly/monthly rhythm to keep noise down.
+
+Run manually:   python daily_scan.py
+Run in CI:       see .github/workflows/daily-scan.yml
+"""
+
+import json
+import os
+import re
+import smtplib
+import ssl
+import sys
+import time
+import urllib.parse
+from datetime import datetime, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+import feedparser
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SOURCES_PATH = os.path.join(HERE, "sources.json")
+SEEN_PATH = os.path.join(HERE, "seen.json")
+
+# ---------------------------------------------------------------------------
+# Tier behaviour: cadence (which weekday/day-of-month it runs) and whether a
+# hit needs to match a strong keyword to be worth emailing.
+# ---------------------------------------------------------------------------
+TIER_CADENCE = {
+    1: "daily",
+    2: "daily",
+    3: "weekly",     # runs Mondays
+    4: "weekly",     # runs Mondays
+    5: "monthly",    # runs on the 1st
+}
+TIER_LABEL = {
+    1: "Primary Band",
+    2: "Secondary Band",
+    3: "Diffuse Band",
+    4: "Early Signal Band",
+    5: "Background Band",
+}
+# Tier 1/2 sources are curated and trusted: surface anything reasonably
+# opportunity-shaped. Tier 3/4 are noisy/broad: only surface strong,
+# unambiguous matches. Tier 5 is excluded from email alerts entirely.
+REQUIRE_STRONG_MATCH_TIERS = {3, 4}
+EXCLUDE_FROM_EMAIL_TIERS = {5}
+
+STRONG_KEYWORDS = [
+    "call for tender", "call for tenders", "invitation to bid",
+    "request for proposal", "request for proposals", "expression of interest",
+    "call for consultant", "call for consultants", "terms of reference",
+    "notice of procurement", "avis d'appel d'offres", "appel d'offres",
+    "appel Ã  propositions", "appel a propositions", "manifestation d'intÃ©rÃªt",
+    "manifestation d'interet", "demande de propositions", "avis de recrutement",
+    "termes de rÃ©fÃ©rence", "termes de reference", "appel Ã  candidatures",
+]
+
+SEARCH_QUERY_EN = '("call for proposals" OR "expression of interest" OR "request for proposals" OR "terms of reference" OR "call for tenders" OR consultancy)'
+SEARCH_QUERY_FR = '("appel Ã  propositions" OR "manifestation d\u2019intÃ©rÃªt" OR "appel d\u2019offres" OR "termes de rÃ©fÃ©rence" OR consultant)'
+
+REQUEST_DELAY_SECONDS = float(os.environ.get("SCAN_DELAY_SECONDS", "0.4"))
+LOOKBACK_DAYS_FOR_FIRST_RUN = 5  # don't flood the first email with the whole backlog
+
+
+def load_json(path, default):
+    if not os.path.exists(path):
+        return default
+    with open(path, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return default
+
+
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def domain_of(url):
+    try:
+        return urllib.parse.urlparse(url).hostname.replace("www.", "")
+    except Exception:
+        return ""
+
+
+def build_feed_url(source, lang="en"):
+    query = SEARCH_QUERY_EN if lang == "en" else SEARCH_QUERY_FR
+    dom = domain_of(source.get("website", ""))
+    scope = f"site:{dom} " if dom else f'"{source["name"]}" '
+    q = scope + query
+    hl = "en-US" if lang == "en" else "fr"
+    gl = "US" if lang == "en" else "FR"
+    ceid = f"{gl}:{hl.split('-')[0]}"
+    return f"https://news.google.com/rss/search?q={urllib.parse.quote(q)}&hl={hl}&gl={gl}&ceid={ceid}"
+
+
+def is_strong_match(text):
+    text_l = text.lower()
+    return any(kw in text_l for kw in STRONG_KEYWORDS)
+
+
+def tier_runs_today(tier, now):
+    cadence = TIER_CADENCE.get(tier, "weekly")
+    if cadence == "daily":
+        return True
+    if cadence == "weekly":
+        return now.weekday() == 0  # Monday
+    if cadence == "monthly":
+        return now.day == 1
+    return True
+
+
+def scan_source(source, seen_ids):
+    """Return list of new items (dicts) found for this source, across EN+FR."""
+    found = []
+    for lang in ("en", "fr"):
+        url = build_feed_url(source, lang)
+        try:
+            feed = feedparser.parse(url)
+        except Exception as e:
+            print(f"  ! fetch error for {source['name']} ({lang}): {e}", file=sys.stderr)
+            continue
+        for entry in feed.entries[:12]:
+            item_id = entry.get("id") or entry.get("link")
+            if not item_id or item_id in seen_ids:
+                continue
+            title = entry.get("title", "").strip()
+            link = entry.get("link", "")
+            published = entry.get("published", "")
+            found.append({
+                "id": item_id,
+                "title": title,
+                "link": link,
+                "published": published,
+                "lang": lang,
+            })
+        time.sleep(REQUEST_DELAY_SECONDS)
+    return found
+
+
+def run_scan():
+    sources = load_json(SOURCES_PATH, [])
+    seen = load_json(SEEN_PATH, {})  # {item_id: iso_seen_timestamp}
+    seen_ids = set(seen.keys())
+    first_run = len(seen_ids) == 0
+
+    now = datetime.now(timezone.utc)
+    results_by_tier = {t: [] for t in range(1, 6)}
+    scanned_count = 0
+
+    for source in sources:
+        tier = int(source.get("tier", 5))
+        if tier in EXCLUDE_FROM_EMAIL_TIERS:
+            continue
+        if not tier_runs_today(tier, now):
+            continue
+
+        scanned_count += 1
+        hits = scan_source(source, seen_ids)
+
+        for hit in hits:
+            seen[hit["id"]] = now.isoformat()
+            seen_ids.add(hit["id"])
+
+            require_strong = tier in REQUIRE_STRONG_MATCH_TIERS
+            if require_strong and not is_strong_match(hit["title"]):
+                continue
+
+            results_by_tier[tier].append({
+                **hit,
+                "source_name": source["name"],
+                "source_category": source.get("category", ""),
+                "source_geo": source.get("geo", ""),
+            })
+
+    save_json(SEEN_PATH, seen)
+
+    print(f"Scanned {scanned_count} sources due today.")
+    for t in range(1, 6):
+        print(f"  Tier {t}: {len(results_by_tier[t])} new item(s)")
+
+    if first_run:
+        print("First run: state file was empty, so this run only seeded the "
+              "'seen' list. No email will be sent to avoid flooding the inbox "
+              "with the entire backlog. Tomorrow's run will alert on genuinely new items.")
+        return results_by_tier, True
+
+    return results_by_tier, False
+
+
+def build_email_html(results_by_tier, now):
+    total = sum(len(v) for v in results_by_tier.values())
+    sections = []
+    for t in (1, 2, 3, 4):
+        items = results_by_tier.get(t, [])
+        if not items:
+            continue
+        rows = ""
+        for it in items:
+            rows += f"""
+            <tr>
+              <td style="padding:8px 10px;border-bottom:1px solid #e5e0d0;">
+                <a href="{it['link']}" style="color:#8a6d1a;text-decoration:none;font-weight:600;">{it['title']}</a><br>
+                <span style="font-size:12px;color:#6b6449;">{it['source_name']} &middot; {it['source_category']} &middot; {it['source_geo']} &middot; {it['published']}</span>
+              </td>
+            </tr>"""
+        sections.append(f"""
+        <h3 style="font-family:Georgia,serif;color:#1b2a40;margin:22px 0 8px;">
+          Tier {t} &mdash; {TIER_LABEL[t]} ({len(items)})
+        </h3>
+        <table style="width:100%;border-collapse:collapse;background:#F2ECDD;border-radius:4px;">
+          {rows}
+        </table>""")
+
+    if not sections:
+        body = """<p style="color:#444;">No new opportunity signals today. The queue is clear.</p>"""
+    else:
+        body = "".join(sections)
+
+    return f"""
+    <div style="font-family:Arial,Helvetica,sans-serif;max-width:640px;margin:0 auto;">
+      <div style="background:#0F1B2B;color:#E9E4D6;padding:20px 24px;border-radius:6px 6px 0 0;">
+        <div style="font-family:Georgia,serif;font-size:20px;font-weight:600;">Opportunity Radar &mdash; Daily Digest</div>
+        <div style="font-size:12px;color:#AEB8C9;margin-top:4px;">{now.strftime('%A, %d %B %Y')} &middot; {total} new item(s)</div>
+      </div>
+      <div style="padding:20px 24px;border:1px solid #e5e0d0;border-top:none;border-radius:0 0 6px 6px;">
+        {body}
+        <p style="font-size:11px;color:#999;margin-top:26px;">
+          Automated scan of {len(load_json(SOURCES_PATH, []))} tracked institutions.
+          Tier 5 (background/association sources) is not included in email alerts &mdash; review it monthly in the Opportunity Radar board.
+        </p>
+      </div>
+    </div>
+    """
+
+
+def send_email(html_body, subject):
+    smtp_host = os.environ["SMTP_HOST"]
+    smtp_port = int(os.environ.get("SMTP_PORT", "465"))
+    smtp_user = os.environ["SMTP_USER"]
+    smtp_pass = os.environ["SMTP_PASS"]
+    mail_from = os.environ.get("ALERT_EMAIL_FROM", smtp_user)
+    mail_to = [addr.strip() for addr in os.environ["ALERT_EMAIL_TO"].split(",") if addr.strip()]
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = mail_from
+    msg["To"] = ", ".join(mail_to)
+    msg.attach(MIMEText(html_body, "html"))
+
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context) as server:
+        server.login(smtp_user, smtp_pass)
+        server.sendmail(mail_from, mail_to, msg.as_string())
+    print(f"Email sent to {mail_to}")
+
+
+def main():
+    now = datetime.now(timezone.utc)
+    results_by_tier, is_first_run = run_scan()
+    total = sum(len(v) for v in results_by_tier.values())
+
+    send_if_empty = os.environ.get("SEND_EMAIL_IF_NO_RESULTS", "false").lower() == "true"
+    if is_first_run:
+        return
+    if total == 0 and not send_if_empty:
+        print("No new items and SEND_EMAIL_IF_NO_RESULTS is false â skipping email.")
+        return
+
+    subject = f"Opportunity Radar: {total} new signal(s) â {now.strftime('%d %b %Y')}" if total else "Opportunity Radar: no new signals today"
+    html = build_email_html(results_by_tier, now)
+
+    if os.environ.get("DRY_RUN", "false").lower() == "true":
+        print("DRY_RUN is true â not sending email. Preview:\n")
+        print(html)
+        return
+
+    send_email(html, subject)
+
+
+if __name__ == "__main__":
+    main() 
